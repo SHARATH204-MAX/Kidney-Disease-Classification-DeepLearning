@@ -1,0 +1,15 @@
+artifact_uri: file:///e:/Kidney-Disease-Classification-DeepLearning/mlruns/0/aaa018b7172f45cfb55ffbc98c3b881e/artifacts
+end_time: 1790745199355
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: aaa018b7172f45cfb55ffbc98c3b881e
+run_name: exultant-fly-62
+run_uuid: aaa018b7172f45cfb55ffbc98c3b881e
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1790745199271
+status: 3
+tags: []
+user_id: manju

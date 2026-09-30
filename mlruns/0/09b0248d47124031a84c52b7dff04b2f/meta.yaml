@@ -1,0 +1,15 @@
+artifact_uri: file:///e:/Kidney-Disease-Classification-DeepLearning/mlruns/0/09b0248d47124031a84c52b7dff04b2f/artifacts
+end_time: 1790745150273
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: 09b0248d47124031a84c52b7dff04b2f
+run_name: redolent-mink-880
+run_uuid: 09b0248d47124031a84c52b7dff04b2f
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1790745128632
+status: 4
+tags: []
+user_id: manju
