@@ -14,7 +14,9 @@ class Evaluation:
 
         datagenerator_kwargs = dict(
             rescale = 1./255,
-            validation_split=0.30
+            # Must match training's validation_split (model_training.py),
+            # otherwise ~1/3 of the evaluated images were seen during training.
+            validation_split=0.20
         )
 
         dataflow_kwargs = dict(

@@ -9,15 +9,18 @@ from PIL import Image
 class PredictionPipeline:
     def __init__(self, filename="inputImage.jpg"):
         self.filename = filename
-        model_path = os.path.join("model", "model.h5")
+        # Prefer the freshly trained model; fall back to the packaged copy.
+        model_path = os.path.join("artifacts", "training", "model.h5")
         if not os.path.exists(model_path):
-            model_path = os.path.join("artifacts", "training", "model.h5")
+            model_path = os.path.join("model", "model.h5")
         self.model = load_model(model_path, compile=False)
 
     def predict_base64(self, base64_str):
         img_bytes = base64.b64decode(base64_str)
         img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-        img = img.resize((224, 224))
+        # Match training preprocessing: ImageDataGenerator(rescale=1./255)
+        # with target_size=(224, 224), interpolation="bilinear"
+        img = img.resize((224, 224), Image.BILINEAR)
         test_image = np.array(img, dtype=np.float32) / 255.0
         test_image = np.expand_dims(test_image, axis=0)
 
