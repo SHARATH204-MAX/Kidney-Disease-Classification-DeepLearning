@@ -16,8 +16,22 @@ class Training:
 
     def get_base_model(self):
 
+        # Load WITHOUT the optimizer restored from disk: the legacy .h5 round
+        # trip leaves the optimizer built with an empty variable set, and
+        # model.fit() then crashes with
+        #   "Unknown variable: <Variable path=dense/kernel ...>"
+        # Compile a fresh optimizer on the loaded model instead.
         self.model = tf.keras.models.load_model(
-            self.config.updated_base_model_path
+            self.config.updated_base_model_path,
+            compile=False
+        )
+
+        self.model.compile(
+            optimizer=tf.keras.optimizers.Adam(
+                learning_rate=self.config.params_learning_rate
+            ),
+            loss="categorical_crossentropy",
+            metrics=["accuracy"]
         )
 
     # -------------------------------------------------------------
