@@ -4,7 +4,10 @@
 
 **Transfer-learning (VGG16) binary classifier for kidney CT scans · Reproducible ML pipeline (DVC) · Experiment tracking (MLflow / DagsHub) · REST inference service (Flask)**
 
+<<<<<<< HEAD
 [![Workflow Status](https://github.com/SHARATH204-MAX/Kidney-Disease-Classification-DeepLearning/actions/workflows/main.yaml/badge.svg)](https://github.com/SHARATH204-MAX/Kidney-Disease-Classification-DeepLearning/actions/workflows/main.yaml)
+=======
+>>>>>>> dfb26f9d02a68c36c2fc1148ae622c7c0d8cadd8
 [![DVC](https://img.shields.io/badge/pipeline-DVC-1F7A3F?logo=dvc&logoColor=white)](https://dvc.org)
 [![MLflow](https://img.shields.io/badge/tracking-MLflow%20%2F%20DagsHub-01cce4)](https://mlflow.org)
 [![TensorFlow](https://img.shields.io/badge/model-TensorFlow%20%2F%20Keras-FF6F00?logo=tensorflow&logoColor=white)](https://www.tensorflow.org)
