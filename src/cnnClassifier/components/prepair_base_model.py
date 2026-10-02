@@ -2,6 +2,15 @@ import tensorflow as tf
 from pathlib import Path
 
 from cnnClassifier.entity.config_entity import PrepareBaseModelConfig
+from cnnClassifier.utils.preprocessing import DEFAULT_BACKBONE, scaling_mode
+
+# Supported backbones. When you add one here, register its pixel-scaling mode
+# in utils/preprocessing.py::BACKBONE_SCALING as well -- the two must agree or
+# training and inference will silently disagree about the input contract.
+BACKBONES = {
+    "VGG16": tf.keras.applications.VGG16,
+    "EfficientNetB0": tf.keras.applications.EfficientNetB0,
+}
 
 
 class PrepareBaseModel:
@@ -11,7 +20,22 @@ class PrepareBaseModel:
 
     def get_base_model(self):
 
-        self.model = tf.keras.applications.VGG16(
+        backbone_name = self.config.params_backbone
+
+        if backbone_name not in BACKBONES:
+            raise ValueError(
+                f"Unknown backbone {backbone_name!r}. "
+                f"Choose one of {sorted(BACKBONES)} (params.yaml -> BACKBONE)."
+            )
+
+        # e.g. EfficientNetB0 bakes Rescaling(1/255) into the graph, so it is
+        # fed raw 0-255 pixels; VGG16 needs the caller to divide by 255.
+        print(
+            f"[prepare_base_model] backbone={backbone_name} "
+            f"(input scaling: {scaling_mode(backbone_name)})"
+        )
+
+        self.model = BACKBONES[backbone_name](
             input_shape=self.config.params_image_size,
             weights=self.config.params_weights,
             include_top=self.config.params_include_top
@@ -32,7 +56,7 @@ class PrepareBaseModel:
     ):
 
         # ---------------------------------------------------------
-        # FREEZE VGG16 BASE MODEL
+        # FREEZE THE BACKBONE (VGG16 / EfficientNetB0 / ...)
         # ---------------------------------------------------------
 
         if freeze_all:

@@ -2,8 +2,7 @@
 
 # Kidney Disease Classification — Deep Learning Service
 
-**Transfer-learning (VGG16) binary classifier for kidney CT scans · Reproducible ML pipeline (DVC) · Experiment tracking (MLflow / DagsHub) · REST inference service (Flask)**
-
+**Transfer-learning (EfficientNetB0) binary classifier for kidney CT scans · Reproducible ML pipeline (DVC) · Experiment tracking (MLflow / DagsHub) · REST inference service (Flask)**
 
 [![Workflow Status](https://github.com/SHARATH204-MAX/Kidney-Disease-Classification-DeepLearning/actions/workflows/main.yaml/badge.svg)](https://github.com/SHARATH204-MAX/Kidney-Disease-Classification-DeepLearning/actions/workflows/main.yaml)
 [![DVC](https://img.shields.io/badge/pipeline-DVC-1F7A3F?logo=dvc&logoColor=white)](https://dvc.org)
@@ -34,6 +33,7 @@
 - [Experiment Tracking & Versioning](#experiment-tracking--versioning)
 - [Evaluation & Metrics](#evaluation--metrics)
 - [Docker & CI/CD](#docker--cicd)
+- [Model Results](#model-results)
 - [Performance & Hardware Notes](#performance--hardware-notes)
 - [Troubleshooting — Known Pitfalls](#troubleshooting--known-pitfalls)
 - [Roadmap](#roadmap)
@@ -55,15 +55,18 @@ runner.
 | Item | Value |
 |---|---|
 | Task | Binary image classification (`Normal` / `Tumor`) |
-| Backbone | VGG16 (ImageNet weights, frozen) + custom classification head |
+| Backbone | EfficientNetB0 (ImageNet weights) + custom classification head · switchable via `params.yaml -> BACKBONE` (`VGG16` also supported) |
+| Training strategy | Two-phase: (1) frozen backbone, head-only, (2) fine-tune the last 30 backbone layers at `lr=5e-6` (`UNFREEZE_LAST`, `FINETUNE_LEARNING_RATE`) |
 | Dataset | 7,360 CT images — 5,077 `Normal`, 2,283 `Tumor`, 512×512 JPEG |
 | Split | 80 / 20 stratified-by-folder → 5,889 train · 1,471 validation |
-| Input tensor | `224 × 224 × 3`, RGB, float32 scaled to `[0, 1]` |
-| Total params | 14,846,530 (131,842 trainable — only the head is trained) |
+| Input tensor | `224 × 224 × 3`, RGB, float32 **raw `0–255`** (EfficientNetB0 rescales internally; VGG16 needs `[0,1]` — see the [contract](#4-preprocessing-contract--invariants)) |
+| Total params | 4,378,021 — 328,450 trainable in phase 1 (head only), 1,825,890 in phase 2 (head + last 30 backbone layers) |
+| Class weights | Inverse-frequency weighting tempered by `CLASS_WEIGHT_POWER` (`0.25` → `Normal 0.92`, `Tumor 1.13`) to counter the 69/31 imbalance without distorting the decision boundary |
 | Serving | Flask REST API + HTML UI on port `8090` (`8080` in Docker) |
 
 > **Class balance warning.** The dataset is ~69% / 31%. A model that predicts `Normal` for every
-> image already "scores" 69% accuracy. Always read accuracy alongside per-class recall — see
+> image already "scores" 69% accuracy — a real checkpoint once reached 73.6% accuracy while
+> missing **80% of tumors**. Always read accuracy alongside per-class recall — see
 > [Evaluation & Metrics](#evaluation--metrics).
 
 ---
@@ -76,10 +79,22 @@ runner.
   entities; components never read YAML directly.
 - **Clean layering** — `components` (business logic) → `pipeline` (stage entry points) →
   `main.py` / `app.py` (orchestration).
-- **Training hygiene** — augmentation, EarlyStopping with weight restoration, ReduceLROnPlateau,
-  best-model checkpointing on `val_accuracy`.
-- **Consistent preprocessing** between training, evaluation and inference (the single most common
-  source of silent accuracy loss — see [Troubleshooting](#troubleshooting--known-pitfalls)).
+- **Training hygiene** — augmentation (rotation / shift / zoom / shear / brightness jitter /
+  flip), label smoothing (`LABEL_SMOOTHING`), EarlyStopping with weight restoration,
+  ReduceLROnPlateau, best-model checkpointing on `val_accuracy` that survives resume.
+- **Two-phase fine-tuning** — train the head on a frozen backbone, then resume
+  (`RESUME_TRAINING`) with `UNFREEZE_LAST` layers unfrozen at a much lower learning rate; the
+  unfreeze walks back from the softmax so it always hits the *tail*, never the stem.
+- **Consistent preprocessing** — training, evaluation and inference all pull their input contract
+  from `utils/preprocessing.py`, so they cannot drift apart (the single most common source of
+  silent accuracy loss — see [Troubleshooting](#troubleshooting--known-pitfalls)).
+- **Imbalance-aware training** — tempered inverse-frequency class weights
+  (`CLASS_WEIGHT_POWER`) plus per-class reporting in `scores.json`, so accuracy cannot hide a
+  model that ignores tumors.
+- **Train/serve parity for inference** — evaluation and the API share
+  `utils/inference.py::predict_probabilities()` (flip-TTA averaged softmax), so the metric in
+  `scores.json` is literally the model's deployed behaviour: **90.96% accuracy / 0.969 tumor
+  recall** versus 88.58% without TTA — see [Model Results](#model-results).
 - **Experiment tracking** — MLflow runs (params + metrics) pushed to DagsHub; `scores.json`
   exposed as a DVC metric.
 - **Containerized delivery** — Dockerfile + CI/CD to ECR → EC2.
@@ -123,9 +138,9 @@ flowchart LR
 ```mermaid
 flowchart TD
     S1["<b>stage 01 — data_ingestion</b><br/>gdown fetch + unzip<br/>artifacts/data_ingestion/DataSet/"]
-    S2["<b>stage 02 — prepare_base_model</b><br/>VGG16(ImageNet, include_top=False)<br/>+ GAP + Dense(256) + Dropout(0.5) + Dense(2)<br/>freeze backbone · compile Adam(1e-4)"]
-    S3["<b>stage 03 — model_training</b><br/>augmented generator · rescale 1/255<br/>20 epochs · EarlyStopping(5)<br/>ReduceLROnPlateau · ModelCheckpoint"]
-    S4["<b>stage 04 — evaluation</b><br/>hold-out generator (shuffle=False)<br/>loss + accuracy"]
+    S2["<b>stage 02 — prepare_base_model</b><br/>EfficientNetB0(ImageNet, include_top=False)<br/>+ GAP + Dense(256) + Dropout(0.5) + Dense(2)<br/>freeze backbone · compile Adam(1e-4)"]
+    S3["<b>stage 03 — model_training</b><br/>augmented generator · backbone scaling<br/>class weights · label smoothing<br/>head-only → fine-tune tail (UNFREEZE_LAST)<br/>EarlyStopping(5) · ReduceLR · BestCheckpoint"]
+    S4["<b>stage 04 — evaluation</b><br/>hold-out generator (shuffle=False)<br/>loss · accuracy · per-class recall"]
     MET[("scores.json<br/>DVC metric")]
     MLFLOW[("MLflow / DagsHub<br/>params + metrics")]
     W[("artifacts/training/model.h5<br/>+ best_model.h5")]
@@ -150,8 +165,8 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    IN["Input<br/>224×224×3 RGB<br/>pixel values scaled to 0 – 1"] --> VGG["VGG16 · ImageNet<br/><i>frozen</i> · 14.7M params"]
-    VGG --> GAP["GlobalAveragePooling2D<br/>→ 512"]
+    IN["Input<br/>224×224×3 RGB<br/>raw pixels 0 – 255"] --> VGG["EfficientNetB0 · ImageNet<br/><i>frozen</i> · internal Rescaling(1/255) · 4.05M params"]
+    VGG --> GAP["GlobalAveragePooling2D<br/>→ 1280"]
     GAP --> D1["Dense 256 · ReLU"]
     D1 --> DO["Dropout 0.5"]
     DO --> D2["Dense 2 · Softmax"]
@@ -162,32 +177,51 @@ flowchart LR
 | Layer | Output shape | Params | Trainable |
 |---|---|---:|---|
 | `InputLayer` | `(None, 224, 224, 3)` | 0 | — |
-| `VGG16` blocks 1–5 (`include_top=False`) | `(None, 7, 7, 512)` | 14,714,688 | ✗ frozen |
-| `GlobalAveragePooling2D` | `(None, 512)` | 0 | — |
-| `Dense(256, relu)` | `(None, 256)` | 131,328 | ✓ |
+| `EfficientNetB0` (`include_top=False`, incl. `Rescaling`/`Normalization`) | `(None, 7, 7, 1280)` | 4,049,571 | ✗ frozen |
+| `GlobalAveragePooling2D` | `(None, 1280)` | 0 | — |
+| `Dense(256, relu)` | `(None, 256)` | 327,936 | ✓ |
 | `Dropout(0.5)` | `(None, 256)` | 0 | — |
 | `Dense(2, softmax)` | `(None, 2)` | 514 | ✓ |
-| **Total** | | **14,846,530** | **131,842 trainable** |
+| **Total** | | **4,378,021** | **328,450 trainable** |
 
 - **Loss:** categorical cross-entropy · **Optimizer:** Adam (`LEARNING_RATE: 0.0001`)
+- **Class weights:** inverse frequency of the training split (`Normal 0.725`, `Tumor 1.610`) so a
+  good loss cannot be reached by ignoring tumors
 - **Augmentation:** rotation 20°, width/height shift 0.10, zoom 0.15, horizontal flip
 - **Callbacks:** EarlyStopping(`val_loss`, patience 5, `restore_best_weights=True`),
   ReduceLROnPlateau(`val_loss`, factor 0.2, patience 2, `min_lr=1e-7`),
-  ModelCheckpoint → `artifacts/training/best_model.h5` (max `val_accuracy`)
+  `BestModelCheckpoint` → `artifacts/training/best_model.h5` (max `val_accuracy`, remembers the
+  best value **across resumed runs**)
 
 ### 4. Preprocessing Contract — Invariants
 
-These four rules must hold in **training, evaluation and inference simultaneously**. Breaking any
-of them produces a model or service that looks runnable but predicts garbage.
+These rules must hold in **training, evaluation and inference simultaneously**. Breaking any of
+them produces a model or service that looks runnable but predicts garbage — this project has hit
+that failure twice, so all three call sites now import the same helper module:
+**`src/cnnClassifier/utils/preprocessing.py`**.
 
-1. **Pixel scaling** — `ImageDataGenerator(rescale=1./255)` during training ⇒ inference must do
-   `np.array(img, dtype=np.float32) / 255.0`. Never feed raw `0–255` values.
-2. **Geometry** — resize to `224 × 224` with **bilinear** interpolation (`interpolation="bilinear"`
-   in the generator; `Image.BILINEAR` in `prediction.py`).
+1. **Pixel scaling is backbone-dependent** — `ImageDataGenerator`, the evaluator and
+   `prediction.py` all call `preprocessing.generator_kwargs()` / `preprocessing.prepare_image()`:
+
+   | Backbone | Scaling | Why |
+   |---|---|---|
+   | `EfficientNetB0` (default) | **raw `0–255`** (`rescale=None`) | the model's first layer is `Rescaling(1/255)`; pre-dividing would feed it ~`[0, 0.004]` |
+   | `VGG16` | `rescale=1./255` → `[0, 1]` | no internal rescaling |
+
+   Never divide by 255 "to be safe" — double-scaling and never-scaling are both silent killers.
+2. **Geometry** — resize to `224 × 224` with **bilinear** interpolation
+   (`preprocessing.INTERPOLATION`), in the generator and in `prediction.py`.
 3. **Class indices** — `flow_from_directory` sorts folder names alphabetically ⇒
    **`Normal = 0`, `Tumor = 1`**. `argmax == 1` is reported as `Tumor`.
 4. **Optimizer state** — a model loaded from legacy `.h5` must be loaded with `compile=False` and
    re-compiled before `fit()` (see [Troubleshooting](#troubleshooting--known-pitfalls)).
+5. **Backbone agreement** — `params.yaml -> BACKBONE` must match the weights on disk. Adding a
+   backbone requires registering it in *both* `components/prepair_base_model.py::BACKBONES` and
+   `utils/preprocessing.py::BACKBONE_SCALING`.
+6. **Probability computation** — evaluation and serving both derive probabilities through
+   **`src/cnnClassifier/utils/inference.py::predict_probabilities()`** (flip-TTA averaged softmax).
+   Same reason as the pixel contract: if `scores.json` is computed one way and the API answers
+   another way, the published metric stops describing the shipped model.
 
 ---
 
@@ -195,7 +229,7 @@ of them produces a model or service that looks runnable but predicts garbage.
 
 | Layer | Technology |
 |---|---|
-| Deep learning | TensorFlow / Keras, VGG16 (ImageNet transfer learning) |
+| Deep learning | TensorFlow / Keras 3, EfficientNetB0 (ImageNet transfer learning; VGG16 optional) |
 | Data handling | `ImageDataGenerator`, NumPy, Pillow, OpenCV/gdown for ingestion |
 | Orchestration | DVC pipelines (`dvc.yaml` + `dvc.lock`) |
 | Experiment tracking | MLflow, DagsHub remote tracking |
@@ -214,7 +248,8 @@ Kidney-Disease-Classification-DeepLearning/
 │
 ├── app.py                          # Flask entry point — serving tier (/, /predict, /train)
 ├── main.py                         # Orchestrates the 4 pipeline stages end-to-end
-├── params.yaml                     # Hyper-parameters (DVC-tracked): EPOCHS, LR, BATCH_SIZE…
+├── params.yaml                     # Hyper-parameters (DVC-tracked): EPOCHS, LR, BATCH_SIZE,
+│                                   #   BACKBONE, RESUME_TRAINING…
 ├── Dockerfile                      # Container image: python:3.8-slim + requirements + app
 ├── requirements.txt                # Runtime dependencies
 ├── setup.py                        # Package definition (src/ layout, `pip install -e .`)
@@ -235,17 +270,20 @@ Kidney-Disease-Classification-DeepLearning/
 │   │                               #   Training/Evaluation configs
 │   ├── config/configuration.py     # ConfigurationManager — YAML → typed entities
 │   ├── utils/common.py             # read_yaml, create_directories, save_json, encode/decode…
+│   ├── utils/preprocessing.py       # ⚠ single source of truth for the input contract
+│   ├── utils/inference.py           # ⚠ single source of truth for probabilities (flip-TTA)
+│   │                               #   (target size, interpolation, split, backbone scaling)
 │   ├── components/                 # Business logic (one class per stage)
 │   │   ├── data_ingestion.py       #   download · skip-if-exists · unzip
-│   │   ├── prepair_base_model.py   #   VGG16 base + classification head + compile
-│   │   ├── model_training.py       #   generators · callbacks · fit · save
+│   │   ├── prepair_base_model.py   #   backbone (EfficientNetB0/VGG16) + head + compile
+│   │   ├── model_training.py       #   generators · class weights · callbacks · fit · save
 │   │   └── model_evaluation_mlflow.py  # hold-out evaluation · scores.json · MLflow
 │   └── pipeline/                   # Thin, importable stage wrappers
 │       ├── stage_01_data_ingestion.py
 │       ├── stage_02_prepair_base_model.py
 │       ├── stage_03_model_training.py
 │       ├── stage_04_model_evaluation.py
-│       └── prediction.py           #   PredictionPipeline — load weights · preprocess · argmax
+│       └── prediction.py           #   PredictionPipeline — load weights · preprocess · TTA probs · argmax
 │
 ├── templates/
 │   └── index.html                  # Single-page UI (upload · preview · results panel)
@@ -418,8 +456,10 @@ print(urllib.request.urlopen(req).read().decode())
 PY
 ```
 
-> Server-side preprocessing is applied inside `predict_base64`: decode → `RGB` → resize
-> `224×224` (bilinear) → `float32 / 255.0` → batch dimension → `argmax`.
+> Server-side preprocessing lives in `preprocessing.prepare_image` (the same helper training and
+> evaluation use): decode → resize `224×224` (bilinear) → backbone scaling (raw `0–255` for
+> EfficientNetB0, `/255` for VGG16) → batch dimension → flip-TTA averaged softmax
+> (`utils/inference.py`, identical to stage 04) → `argmax`.
 
 ### `GET|POST /train`
 
@@ -435,14 +475,20 @@ for long trainings prefer `python main.py` in a terminal or `dvc repro`.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `AUGMENTATION` | `True` | Enable random rotation/shift/zoom/flip on the training split |
-| `IMAGE_SIZE` | `[224, 224, 3]` | Model input shape (VGG16 native resolution) |
-| `BATCH_SIZE` | `16` | Mini-batch size (369 steps/epoch on 5,889 images) |
-| `INCLUDE_TOP` | `False` | Drop the VGG16 classifier head |
+| `AUGMENTATION` | `True` | Training-split augmentation: rotation 20°, shift 0.10, zoom 0.15, shear 0.10, brightness ×0.8–1.2, horizontal flip |
+| `IMAGE_SIZE` | `[224, 224, 3]` | Model input shape (both backbones' native resolution) |
+| `BATCH_SIZE` | `32` | Mini-batch size (185 steps/epoch on 5,889 images) |
+| `INCLUDE_TOP` | `False` | Drop the backbone's classifier head |
 | `EPOCHS` | `20` | Maximum epochs (EarlyStopping may stop sooner) |
 | `CLASSES` | `2` | Output units (`Normal`, `Tumor`) |
 | `WEIGHTS` | `imagenet` | Backbone initialization |
-| `LEARNING_RATE` | `0.0001` | Adam learning rate |
+| `LEARNING_RATE` | `0.0001` | Adam learning rate (phase 1) |
+| `BACKBONE` | `EfficientNetB0` | Which backbone to train — `EfficientNetB0` \| `VGG16`. Drives the pixel-scaling contract everywhere |
+| `RESUME_TRAINING` | `False` | `True` → continue from `artifacts/training/best_model.h5` instead of starting over (also the switch that starts phase 2) |
+| `UNFREEZE_LAST` | `0` | Trailing backbone layers to unfreeze for fine-tuning; `0` = keep the backbone frozen (phase 1) |
+| `FINETUNE_LEARNING_RATE` | `1e-5` | Adam learning rate used when unfreezing (phase 2) |
+| `CLASS_WEIGHT_POWER` | `1.0` | Tempering exponent on inverse-frequency class weights: `1.0` full, `0.25` mild, `0.0` off |
+| `LABEL_SMOOTHING` | `0.0` | Label smoothing for the cross-entropy loss; `0.1` used in training to curb overconfident errors |
 
 ### `config/config.yaml` — paths
 
@@ -464,6 +510,7 @@ for long trainings prefer `python main.py` in a terminal or `dvc repro`.
 | `MLFLOW_TRACKING_PASSWORD` | MLflow auth token — **required by stage 04** |
 | `TF_ENABLE_ONEDNN_OPTS` | Set to `0` by `app.py` for deterministic inference |
 | `CUDA_VISIBLE_DEVICES` | Set to `-1` by `app.py` (CPU-only serving) |
+| `MODEL_BACKBONE` | Optional override of `params.yaml -> BACKBONE` for the service (containers) |
 
 ---
 
@@ -489,33 +536,86 @@ mlflow ui          # local tracking UI (defaults to ./mlruns)
 
 ## Evaluation & Metrics
 
-The evaluation stage builds a **hold-out generator that mirrors training**:
+The evaluation stage builds a **hold-out generator from the same helper as training**:
 
 ```python
-ImageDataGenerator(rescale=1./255, validation_split=0.20)
+from cnnClassifier.utils import preprocessing
+
+ImageDataGenerator(**preprocessing.generator_kwargs(backbone))   # scaling + split
     .flow_from_directory(..., subset="validation", shuffle=False,
-                         target_size=(224, 224), interpolation="bilinear")
+                         **preprocessing.dataflow_kwargs(batch_size))
 ```
 
 - `shuffle=False` keeps predictions aligned with `generator.classes`.
 - `validation_split=0.20` **must match training** — using a larger split would evaluate on images
   the model has already seen (leakage).
+- Probabilities come from `utils/inference.py::predict_probabilities()` — the **same flip-TTA
+  code path the Flask API uses** — over manually pulled batches, so loss, accuracy and the
+  confusion matrix all derive from one set of predictions.
 
 **Reading the numbers**
 
 | Metric | Location | Notes |
 |---|---|---|
 | `loss`, `accuracy` | `scores.json` | Written by stage 04; DVC metric |
-| `loss`, `accuracy` | MLflow run | Same values, plus full param set |
+| `precision_normal`, `recall_normal`, `precision_tumor`, `recall_tumor`, `confusion_matrix` | `scores.json` | Same file — per-class detail, also DVC-readable |
+| `loss`, `accuracy` | MLflow run | Same values, plus full param set (when `log_into_mlflow()` is enabled) |
 | Training curve | console / `logs/running_logs.log` | Per-epoch `loss`, `val_loss`, `val_accuracy` |
 
 Because of the 69/31 class imbalance:
 
 - treat **accuracy ≈ 0.69** as *"predicts `Normal` every time"* until proven otherwise;
-- a healthy model should show both `accuracy` well above the class prior **and** a
-  `val_loss` far below `ln(2) ≈ 0.693`;
-- add per-class recall / confusion matrix reporting before trusting the model clinically
-  (tracked in the [Roadmap](#roadmap)).
+- a healthy model shows `accuracy` well above the class prior **and** `val_loss` far below
+  `ln(2) ≈ 0.693`;
+- **judge the model by `recall_tumor`** — one checkpoint hit 73.6% accuracy while missing 366 of
+  456 tumors (recall 0.197). Accuracy alone would have called that run "close".
+
+---
+
+## Model Results
+
+Measured by stage 04 on the validation split — **1,471 images (1,015 `Normal` / 456 `Tumor`)**,
+single 80/20 split, no test-set leakage.
+
+### Headline
+
+| Configuration | Accuracy | `recall_tumor` | `recall_normal` |
+|---|---:|---:|---:|
+| **Shipped: flip-TTA, threshold 0.50** | **0.9096** | **0.9693** | 0.8828 |
+| Same weights, no TTA (plain argmax) | 0.8858 | 0.9518 | 0.8562 |
+| Optional high-accuracy point: TTA, threshold 0.60 | 0.9211 | 0.9123 | 0.9251 |
+
+Confusion matrix at the shipped configuration (rows = actual, cols = predicted):
+
+|  | → Pred `Normal` | → Pred `Tumor` |
+|---|---:|---:|
+| **Actual `Normal`** | 896 | 119 |
+| **Actual `Tumor`** | 14 | 442 |
+
+> The old failure mode is gone in both directions: the legacy checkpoint missed **366 of 456
+> tumors**; this one misses **14**, while only 119 of 1,015 normals trigger a (recoverable)
+> false alarm.
+
+### Accuracy journey
+
+| Run | Accuracy | `recall_tumor` | What changed |
+|---|---:|---:|---|
+| Legacy VGG16 checkpoint | 0.7360 | 0.197 | collapsed toward the 69% majority class |
+| Phase 1 — EfficientNetB0, frozen backbone | 0.8477 | 0.943 | backbone switch + class weights |
+| Phase 2 — fine-tune last 30 layers @ `1e-5` | 0.8851 | 0.950 | +3.7 pts |
+| Round 3 — label smoothing · shear/brightness aug · `CLASS_WEIGHT_POWER: 0.25` @ `5e-6` | 0.8858 | 0.952 | +0.1 pt; regularisation held the train/val gap |
+| **+ flip-TTA (shared eval/serve path)** | **0.9096** | **0.969** | **+2.4 pts — target crossed** |
+
+**Notes**
+
+- TTA = `mean(softmax(x), softmax(hflip(x)))` in `utils/inference.py`; horizontal mirroring is
+  anatomically valid for CT slices. It is *not* a reporting trick: stage 04 and the Flask API
+  call the same function, so `scores.json` describes deployed behaviour.
+- The threshold 0.60 row is a documented operating-point trade-off
+  (full sweep: `artifacts/training/operating_point_suite.json`), **not** the shipped default —
+  it buys +1.15 accuracy while giving up 26 detected tumors.
+- Threshold and TTA were both validated on the same split used for reporting (mild optimism);
+  a locked-off test split is on the [Roadmap](#roadmap).
 
 ---
 
@@ -547,8 +647,16 @@ Required repository secrets:
 
 ## Performance & Hardware Notes
 
-- Training is the bottleneck: **≈ 8 s/step** on a 12-logical-core CPU-only machine
-  (≈ 50–60 min/epoch at `BATCH_SIZE=16`), i.e. many hours for a full 20-epoch run.
+Measured on a 12-logical-core CPU-only machine (no GPU), `BATCH_SIZE=32`, 185 steps/epoch:
+
+| Phase | Per-step | Per-epoch | Notes |
+|---|---:|---:|---|
+| Phase 1 — head only (backbone frozen) | ~1.3 s | ~4 min | 39 min total for a full run with EarlyStopping |
+| Phase 2 — fine-tuning last 30 layers | 2–4 s | 7–12 min | ~40 s validation pass; forward+backward now cover 1.8 M trainable params |
+| Evaluation (stage 04) | ~0.7 s | ~40 s total | 1,471 validation images in one `predict()` pass |
+
+- Training is the bottleneck: expect roughly **1–2 hours** for a resume-based fine-tuning run
+  with EarlyStopping, versus minutes for head-only training.
 - Inference is cheap: a single `predict` call takes well under a second after the model is loaded.
 - Levers if you need speed: raise `BATCH_SIZE` (CPU is rarely saturated), enable GPU
   (`CUDA_VISIBLE_DEVICES`), lower `EPOCHS` for smoke tests, or run `dvc repro` so unchanged
@@ -562,7 +670,10 @@ Required repository secrets:
 | Symptom | Root cause | Fix |
 |---|---|---|
 | Every prediction returns the same label; `scores.json` accuracy ≈ 0.69 | Training was run with `EPOCHS=1` / `LEARNING_RATE=0.01` — the head diverged (loss 10–15) and collapsed to the majority class | Train with the configured `EPOCHS: 20` / `LEARNING_RATE: 0.0001`, then verify `val_loss` drops below 0.693 |
-| Predictions random/wrong although training accuracy looks fine | Inference feeds raw `0–255` pixels while training used `rescale=1./255` | Restore `np.array(img, dtype=np.float32) / 255.0` in `pipeline/prediction.py` |
+| High accuracy but terrible `recall_tumor` | Unweighted training on a 69/31 split lets the model buy accuracy by ignoring `Tumor` (measured: 73.6% acc, 19.7% recall) | Keep class weights enabled in `components/model_training.py`; judge runs by `recall_tumor` |
+| Predictions random/wrong although training accuracy looks fine | Inference and training disagree about pixel scaling (one feeds `0–255`, the other `0–1`) | Never hand-code scaling: call `utils/preprocessing.py` from training, evaluation **and** `prediction.py` |
+| Predictions collapse after switching `BACKBONE` | New backbone has a different input contract (e.g. EfficientNetB0 already divides by 255 internally) while stale weights/preprocessing remain | Keep `BACKBONE` in sync across `params.yaml`, the weights on disk, and the preprocessing helper |
+| Fine-tuning barely moves the needle (~1,280 params train instead of millions) | The unfreeze searched for the *first* `GlobalAveragePooling2D`; in EfficientNet every squeeze-and-excite block has one, so the stem got unfrozen instead of the tail | Walk back from the final softmax over the trailing `[GAP, Dense, Dropout, Dense]` run — `components/model_training.py` prints first/last unfrozen layer names, verify they end at `top_activation` |
 | `ValueError: Unknown variable: <Variable path=dense/kernel …> — This optimizer can only be called for the variables it was originally built with` | Keras 3 legacy-`.h5` round-trip leaves the restored optimizer built with an empty variable set | `load_model(path, compile=False)` then call `model.compile(...)` with a fresh optimizer (`components/model_training.py`) |
 | Evaluation accuracy higher than it should be | Eval `validation_split=0.30` vs training `0.20` ⇒ ~⅓ of evaluated images were trained on | Keep both splits identical (`0.20`) |
 | Retrained but the app still predicts like before | Weights are loaded at process start; `model/model.h5` is a packaged copy | Restart `app.py`; `PredictionPipeline` now prefers `artifacts/training/model.h5` |
@@ -574,9 +685,16 @@ Required repository secrets:
 
 ## Roadmap
 
-- [ ] Per-class metrics: precision / recall / F1, confusion matrix and ROC-AUC in `scores.json`
-- [ ] Class-weighted loss to counter the 69/31 imbalance
-- [ ] Fine-tuning phase: unfreeze `block5_conv*` at `lr=1e-5` for a final accuracy push
+- [x] Per-class metrics: precision / recall, confusion matrix in `scores.json`
+- [x] Class-weighted loss to counter the 69/31 imbalance
+- [x] Single shared preprocessing contract (`utils/preprocessing.py`) for train/eval/serve
+- [x] Crash-resume: `RESUME_TRAINING: True` continues from `best_model.h5`
+- [x] Fine-tuning phase: `UNFREEZE_LAST` unfreezes the trailing backbone layers at
+      `FINETUNE_LEARNING_RATE`; the unfreeze walks back from the softmax (EfficientNet's
+      squeeze-and-excite blocks each contain a GAP layer, so "first GAP" finds the stem)
+- [x] Anti-overfitting levers: label smoothing (`LABEL_SMOOTHING`) + shear/brightness
+      augmentation, gated by measured `CLASS_WEIGHT_POWER`
+- [ ] ROC-AUC / F1 aggregation in `scores.json`
 - [ ] Migrate legacy `.h5` artefacts to the native `.keras` format
 - [ ] Real unit/integration tests replacing the CI placeholders
 - [ ] GPU-enabled training (CUDA) and batched prediction endpoint
@@ -589,7 +707,8 @@ Required repository secrets:
 
 ## Acknowledgments
 
-- [VGG16](https://arxiv.org/abs/1409.1556) — Simonyan & Zisserman, ImageNet weights via Keras Applications
+- [EfficientNet](https://arxiv.org/abs/1905.11946) — Tan & Le, "EfficientNet: Rethinking Model Scaling for CNNs"; weights via Keras Applications
+- [VGG16](https://arxiv.org/abs/1409.1556) — Simonyan & Zisserman (supported alternative backbone)
 - [MLflow](https://mlflow.org/) · [DagsHub](https://dagshub.com/) · [DVC](https://dvc.org/)
 - [TensorFlow / Keras](https://www.tensorflow.org/) · [Flask](https://flask.palletsprojects.com/)
 

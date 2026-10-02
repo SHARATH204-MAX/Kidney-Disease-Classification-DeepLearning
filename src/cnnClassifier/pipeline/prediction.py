@@ -5,6 +5,11 @@ import base64
 import io
 from PIL import Image
 
+from cnnClassifier.constants import PARAMS_FILE_PATH
+from cnnClassifier.utils import preprocessing
+from cnnClassifier.utils.inference import predict_probabilities
+from cnnClassifier.utils.common import read_yaml
+
 
 class PredictionPipeline:
     def __init__(self, filename="inputImage.jpg"):
@@ -14,17 +19,27 @@ class PredictionPipeline:
         if not os.path.exists(model_path):
             model_path = os.path.join("model", "model.h5")
         self.model = load_model(model_path, compile=False)
+        # Inference must use the backbone training used, because it decides
+        # whether pixels are rescaled here or inside the model
+        # (see utils/preprocessing.py). params.yaml is the source of truth;
+        # MODEL_BACKBONE lets a container override it without editing files.
+        params = read_yaml(PARAMS_FILE_PATH)
+        self.backbone = os.getenv("MODEL_BACKBONE") or params.get(
+            "BACKBONE", preprocessing.DEFAULT_BACKBONE
+        )
 
     def predict_base64(self, base64_str):
         img_bytes = base64.b64decode(base64_str)
-        img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-        # Match training preprocessing: ImageDataGenerator(rescale=1./255)
-        # with target_size=(224, 224), interpolation="bilinear"
-        img = img.resize((224, 224), Image.BILINEAR)
-        test_image = np.array(img, dtype=np.float32) / 255.0
-        test_image = np.expand_dims(test_image, axis=0)
+        img = Image.open(io.BytesIO(img_bytes))
+        # Builds (1, 224, 224, 3) float32 exactly like the training and
+        # evaluation generators do (bilinear resize + backbone scaling mode).
+        test_image = preprocessing.prepare_image(img, backbone=self.backbone)
 
-        preds = self.model(test_image, training=False).numpy()
+        # Same probability computation as stage-04 evaluation (utils/inference.py):
+        # flip-TTA averaged softmax, argmax at 0.5. Evaluation and serving must
+        # not drift apart, or the score in scores.json stops describing the
+        # model that answers here.
+        preds = predict_probabilities(self.model, test_image)
         result = np.argmax(preds, axis=1)
 
         if result[0] == 1:

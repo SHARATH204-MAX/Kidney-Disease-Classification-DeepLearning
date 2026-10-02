@@ -21,6 +21,7 @@ class PrepareBaseModelConfig:
     params_include_top: bool
     params_weights: str
     params_classes: int
+    params_backbone: str = "EfficientNetB0"
 
 
 
@@ -35,6 +36,12 @@ class TrainingConfig:
     params_is_augmentation: bool
     params_image_size: list
     params_learning_rate: float
+    params_backbone: str = "EfficientNetB0"
+    params_resume: bool = False
+    params_unfreeze_last: int = 0
+    params_finetune_learning_rate: float = 1e-5
+    params_class_weight_power: float = 1.0
+    params_label_smoothing: float = 0.0
 
 
 
@@ -46,3 +53,4 @@ class EvaluationConfig:
     mlflow_uri: str
     params_image_size: list
     params_batch_size: int
+    params_backbone: str = "EfficientNetB0"

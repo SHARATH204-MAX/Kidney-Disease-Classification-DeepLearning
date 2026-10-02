@@ -1,8 +1,43 @@
 AUGMENTATION: True
-IMAGE_SIZE: [224, 224, 3] # as per VGG 16 model
-BATCH_SIZE: 16
+IMAGE_SIZE: [224, 224, 3] # as per the backbone's native input resolution
+BATCH_SIZE: 32 # larger batches amortise the CPU-heavy forward pass
 INCLUDE_TOP: False
 EPOCHS: 20
 CLASSES: 2
 WEIGHTS: imagenet
 LEARNING_RATE: 0.0001
+
+# Backbone: EfficientNetB0 | VGG16 (must exist in components/prepair_base_model.py
+# and in utils/preprocessing.py::BACKBONE_SCALING).
+# EfficientNetB0 ships a Rescaling(1/255) layer, so it is fed raw 0-255 pixels.
+BACKBONE: EfficientNetB0
+
+# Set to True to continue an interrupted run from artifacts/training/best_model.h5
+# instead of restarting from scratch. Also used to start phase-2 fine-tuning
+# from the phase-1 checkpoint. A fresh run (False) discards stale checkpoint
+# state so it cannot block saving a new model.
+RESUME_TRAINING: True
+
+# Phase-2 fine-tuning: number of trailing backbone layers to unfreeze.
+# 0 = keep the backbone frozen (phase 1). Use together with RESUME_TRAINING: True.
+UNFREEZE_LAST: 30
+FINETUNE_LEARNING_RATE: 0.000005 # ~20x lower than LEARNING_RATE when unfreezing
+
+# Tempering exponent for the inverse-frequency class weights.
+#   1.0 = full inverse frequency (Normal 0.72 / Tumor 1.61)
+#   0.5 = square-root tempering  (Normal 0.85 / Tumor 1.27)
+#   0.25 = quarter-power tempering (Normal 0.98 / Tumor 1.19)
+#   0.0 = no class weighting
+# Full weighting maximises tumor recall but pushes the decision boundary so far
+# toward "Tumor" that ~20% of normals are mislabelled and overall accuracy
+# drops ~4 points (measured). 0.5 kept a real minority bias but still
+# over-called Tumor (146/1015 normals at the 0.5 threshold); the sweep showed
+# the accuracy-optimal boundary sits ~0.6 -- 0.25 nudges the trained boundary
+# toward that point while keeping a tumor-recall safety margin.
+CLASS_WEIGHT_POWER: 0.25
+
+# Soften hard 0/1 targets (CategoricalCrossentropy label_smoothing).
+# Counters overconfidence: at 0.1 the phase-2 model's confidently-wrong
+# predictions (35 of 169 errors had |p-0.5| > 0.30) shrink and the train/val
+# gap (0.97 vs 0.885) narrows. 0.0 = classic one-hot cross-entropy.
+LABEL_SMOOTHING: 0.1

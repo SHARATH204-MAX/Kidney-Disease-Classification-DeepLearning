@@ -160,3 +160,5 @@ cython_debug/
 #.idea/
 
 artifacts/*
+# Runtime log output (training/service)
+logs/
